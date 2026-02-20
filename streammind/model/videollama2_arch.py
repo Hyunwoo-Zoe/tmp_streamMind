@@ -140,6 +140,21 @@ class Videollama2MetaForCausalLM(ABC):
         cpu_dtype_env = os.getenv("STREAMMIND_CPU_DTYPE", "bf16").strip().lower()
         cpu_dtype = torch.bfloat16 if cpu_dtype_env in ("bf16", "bfloat16") else torch.float32
 
+        def _sync_if_cuda_tensor(x):
+            if isinstance(x, torch.Tensor) and x.device.type == "cuda":
+                try:
+                    torch.cuda.synchronize(device=x.device)
+                except Exception:
+                    pass
+
+        def _sync_if_cuda_device(dev):
+            try:
+                d = dev if isinstance(dev, torch.device) else torch.device(dev)
+                if d.type == "cuda":
+                    torch.cuda.synchronize(device=d)
+            except Exception:
+                pass
+
         # -----------------------------
         # input normalize
         # -----------------------------
@@ -165,12 +180,10 @@ class Videollama2MetaForCausalLM(ABC):
         # -----------------------------
         # 1) CLIP feature (usually GPU)
         # -----------------------------
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
+        _sync_if_cuda_tensor(frames)
         t_clip0 = time.perf_counter()
         frames_features = self.get_model().get_vision_tower()(frames)
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
+        _sync_if_cuda_tensor(frames_features)
         clip_ms = 1000.0 * (time.perf_counter() - t_clip0)
 
         # [B, T, N, H]
@@ -188,15 +201,13 @@ class Videollama2MetaForCausalLM(ABC):
         xfer_past_ms = 0.0
 
         if gate_mode == "cpu":
-            if frames_features_new.device.type == "cuda" and torch.cuda.is_available():
-                torch.cuda.synchronize()
+            _sync_if_cuda_tensor(frames_features_new)
             t_off0 = time.perf_counter()
 
             frames_features_new = frames_features_new.detach().to("cpu", dtype=cpu_dtype).contiguous()
             frames_features = frames_features_new  # 이후 캐시 로직도 CPU 텐서 기준으로 진행
 
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
+            _sync_if_cuda_tensor(frames_features_new)
             offload_ms += 1000.0 * (time.perf_counter() - t_off0)
         else:
             frames_features_new = frames_features_new.detach()
@@ -209,19 +220,16 @@ class Videollama2MetaForCausalLM(ABC):
             past_frames_features = past_frames_features.detach()
             if past_frames_features.device != frames_features.device:
                 if gate_mode == "cpu":
-                    if past_frames_features.device.type == "cuda" and torch.cuda.is_available():
-                        torch.cuda.synchronize()
+                    _sync_if_cuda_tensor(past_frames_features)
                     t_p0 = time.perf_counter()
                     past_frames_features = past_frames_features.to("cpu", dtype=cpu_dtype).contiguous()
-                    if torch.cuda.is_available():
-                        torch.cuda.synchronize()
+                    _sync_if_cuda_tensor(past_frames_features)
                     xfer_past_ms = 1000.0 * (time.perf_counter() - t_p0)
                     offload_ms += xfer_past_ms
                 else:
                     t_p0 = time.perf_counter()
                     past_frames_features = past_frames_features.to(frames_features.device, non_blocking=True)
-                    if torch.cuda.is_available():
-                        torch.cuda.synchronize()
+                    _sync_if_cuda_tensor(past_frames_features)
                     xfer_past_ms = 1000.0 * (time.perf_counter() - t_p0)
 
             frames_features = torch.cat((past_frames_features, frames_features), dim=1)
@@ -308,8 +316,19 @@ class Videollama2MetaForCausalLM(ABC):
 
                 if _HAS_IPEX and os.getenv("STREAMMIND_USE_IPEX", "1") == "1":
                     m = ipex.optimize(m, dtype=cpu_dtype, level="O1", inplace=True)
+                    self._mm_projector_cpu_fallback = m
+                    self._mm_projector_cpu_is_compiled = False
                     if os.getenv("STREAMMIND_IPEX_COMPILE", "0") == "1":
-                        m = torch.compile(m, backend="ipex")
+                        try:
+                            m = torch.compile(m, backend="ipex")
+                            self._mm_projector_cpu_is_compiled = True
+                        except Exception as e:
+                            if not getattr(self, "_ipex_compile_warned", False):
+                                self._ipex_compile_warned = True
+                                print(f"[WARN] IPEX torch.compile failed; fallback to ipex.optimize only: {type(e).__name__}: {e}")
+                else:
+                    self._mm_projector_cpu_fallback = m
+                    self._mm_projector_cpu_is_compiled = False
 
                 self._mm_projector_cpu = m
                 self._mm_projector_cpu_dtype = cpu_dtype
@@ -334,19 +353,19 @@ class Videollama2MetaForCausalLM(ABC):
 
         # full 경로 xfer (기존 그대로)
         if frames_for_gate_dev.device != gate_dev:
-            if torch.cuda.is_available(): torch.cuda.synchronize()
+            _sync_if_cuda_tensor(frames_for_gate_dev)
             t_x0 = time.perf_counter()
             frames_for_gate_dev = frames_for_gate_dev.to(gate_dev, non_blocking=True)
-            if torch.cuda.is_available(): torch.cuda.synchronize()
+            _sync_if_cuda_tensor(frames_for_gate_dev)
             xfer_gate_ms = 1000.0 * (time.perf_counter() - t_x0)
 
         # incremental 경로 xfer (추가)
         xfer_gate_new_ms = 0.0
         if frames_new_for_gate_dev.device != gate_dev:
-            if torch.cuda.is_available(): torch.cuda.synchronize()
+            _sync_if_cuda_tensor(frames_new_for_gate_dev)
             t_x0 = time.perf_counter()
             frames_new_for_gate_dev = frames_new_for_gate_dev.to(gate_dev, non_blocking=True)
-            if torch.cuda.is_available(): torch.cuda.synchronize()
+            _sync_if_cuda_tensor(frames_new_for_gate_dev)
             xfer_gate_new_ms = 1000.0 * (time.perf_counter() - t_x0)
 
         print(f"[XFER_GATE] full={xfer_gate_ms:.2f} ms  new={xfer_gate_new_ms:.2f} ms  "
@@ -357,22 +376,38 @@ class Videollama2MetaForCausalLM(ABC):
         # 8) run projector (gate compute)
         # -----------------------------
         def _run_projector(frames_feat_dev: torch.Tensor):
+            nonlocal mm_proj
             proj_type = getattr(self.config, "mm_projector_type", "")
-            
-            if proj_type in ("mlp2x_gelu", "linear"):
-                return mm_proj(frames_feat_dev.mean(1))
-            elif proj_type in ("spatial_conv", "spatial_pool"):
-                return mm_proj(frames_feat_dev)
-            elif ("tc_connector" in proj_type) or ("tp_connector" in proj_type) or ("mamba" in proj_type):
-                return mm_proj(
-                    frames_feat_dev,
-                    cls_inference=True,
-                    cls_training=False,
-                    cls_demo=False,
-                    frames_features_shape=frames_features_shape_for_gate,
-                )
-            else:
+
+            def _call(module):
+                if proj_type in ("mlp2x_gelu", "linear"):
+                    return module(frames_feat_dev.mean(1))
+                if proj_type in ("spatial_conv", "spatial_pool"):
+                    return module(frames_feat_dev)
+                if ("tc_connector" in proj_type) or ("tp_connector" in proj_type) or ("mamba" in proj_type):
+                    return module(
+                        frames_feat_dev,
+                        cls_inference=True,
+                        cls_training=False,
+                        cls_demo=False,
+                        frames_features_shape=frames_features_shape_for_gate,
+                    )
                 raise Exception(f"Unsupported projector type {proj_type}!!!")
+
+            try:
+                return _call(mm_proj)
+            except Exception as e:
+                can_fallback = gate_mode == "cpu" and getattr(self, "_mm_projector_cpu_is_compiled", False)
+                fallback_proj = getattr(self, "_mm_projector_cpu_fallback", None)
+                if can_fallback and fallback_proj is not None:
+                    if not getattr(self, "_ipex_runtime_fallback_warned", False):
+                        self._ipex_runtime_fallback_warned = True
+                        print(f"[WARN] Compiled IPEX projector failed at runtime; fallback to ipex.optimize only: {type(e).__name__}: {e}")
+                    self._mm_projector_cpu = fallback_proj
+                    self._mm_projector_cpu_is_compiled = False
+                    mm_proj = fallback_proj
+                    return _call(mm_proj)
+                raise
 
         # [Helper] Unwrapping Step Function
         def _get_step_method(model):
@@ -440,8 +475,8 @@ class Videollama2MetaForCausalLM(ABC):
 
 
         DEBUG_TIMING = os.getenv("STREAMMIND_DEBUG_TIMING", "0") == "1"
-        if DEBUG_TIMING and torch.cuda.is_available():
-            torch.cuda.synchronize()
+        if DEBUG_TIMING:
+            _sync_if_cuda_device(gate_dev)
         t_g0 = time.perf_counter()
 
         try:
@@ -471,8 +506,8 @@ class Videollama2MetaForCausalLM(ABC):
             print(f"[ERR] Projector run failed: {e}")
             raise
 
-        if DEBUG_TIMING and torch.cuda.is_available():
-            torch.cuda.synchronize()
+        if DEBUG_TIMING:
+            _sync_if_cuda_device(gate_dev)
         gate_compute_ms = 1000.0 * (time.perf_counter() - t_g0)
         
         # [수정] Inner Module에서 시간 측정값 가져오기 (Wrapper 통과)
@@ -1116,8 +1151,11 @@ class Videollama2MetaForCausalLM(ABC):
 
                 t0 = time.perf_counter()
                 cur_X_features = cur_X_cpu.to(device=cur_input_ids.device, non_blocking=True)
-                if torch.cuda.is_available():
-                    torch.cuda.synchronize()
+                if cur_input_ids.device.type == "cuda":
+                    try:
+                        torch.cuda.synchronize(device=cur_input_ids.device)
+                    except Exception:
+                        pass
                 t1 = time.perf_counter()
 
                 self._dbg_xfer_k_ms = float(1000.0 * (t1 - t0))

@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 import lightning as L
+import os
 from lightning.pytorch.callbacks import LearningRateMonitor
 from torchmetrics.functional import accuracy
 from dataclasses import dataclass
@@ -10,15 +11,16 @@ from functools import partial
 import math
 import einops
 
+_DEBUG_SSM = (os.getenv("STREAMMIND_DEBUG_SSM", "0") == "1")
+
 def selective_scan_ref(u, delta, A, B, C, D=None, delta_bias=None, delta_softplus=False):
-    import os
-    if os.getenv("STREAMMIND_DEBUG_SSM", "0") == "1" and not getattr(selective_scan_ref, "_dbg_once", False):
+    if _DEBUG_SSM and not getattr(selective_scan_ref, "_dbg_once", False):
         selective_scan_ref._dbg_once = True
         print(f"[DBG_SSM] selective_scan_ref entered: u.dtype={u.dtype} delta.dtype={delta.dtype}")
 
     dtype_in = u.dtype
     u = u.float()
-    if os.getenv("STREAMMIND_DEBUG_SSM", "0") == "1" and getattr(selective_scan_ref, "_dbg_once2", False) is False:
+    if _DEBUG_SSM and getattr(selective_scan_ref, "_dbg_once2", False) is False:
         selective_scan_ref._dbg_once2 = True
         print(f"[DBG_SSM] after cast: u.dtype={u.dtype} delta.dtype={delta.dtype}")
 

@@ -334,6 +334,8 @@ class Video_Mamba_seq(LightningModule):
         self.cls_net = ClsNet( d_model=model_config.hidden_size, depth=4, n_class=2)
         self.time_list = []
         self.videoid = 0 
+        self._debug_mamba = (os.getenv("STREAMMIND_DEBUG_MAMBA", "0") == "1")
+        self._dbg_mamba_once = False
 
     def step(self, x, state=None, frames_features_shape=None):
         """
@@ -406,7 +408,7 @@ class Video_Mamba_seq(LightningModule):
         
         b, t, l, d = x.shape
 
-        if os.getenv("STREAMMIND_DEBUG_MAMBA", "0") == "1" and not getattr(self, "_dbg_mamba_once", False):
+        if self._debug_mamba and not self._dbg_mamba_once:
             self._dbg_mamba_once = True
             print(f"[DBG_MAMBA] input x shape={tuple(x.shape)} dev={x.device} dtype={x.dtype}")
             print(f"[DBG_MAMBA] pre_net dtype={next(self.pre_net.parameters()).dtype} dev={next(self.pre_net.parameters()).device}")

@@ -535,8 +535,11 @@ class Videollama2MistralForCausalLM(MistralForCausalLM, Videollama2MetaForCausal
                 return (None, 0)
             return None if not return_metrics else (None, metrics)
 
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
+        if isinstance(inputs_embeds, torch.Tensor) and inputs_embeds.device.type == "cuda":
+            try:
+                torch.cuda.synchronize(device=inputs_embeds.device)
+            except Exception:
+                pass
         t1 = time.perf_counter()
 
         gate_ms = 1000.0 * (t1 - t0)
@@ -618,10 +621,14 @@ class Videollama2MistralForCausalLM(MistralForCausalLM, Videollama2MetaForCausal
         # 4. LLM 생성 (Decording)
         # ----------------------------------------------------------------------
         decode_gpu_ms = 0.0
-        if torch.cuda.is_available():
+        use_cuda_timing = isinstance(inputs_embeds, torch.Tensor) and inputs_embeds.device.type == "cuda"
+        if use_cuda_timing:
             ev0 = torch.cuda.Event(enable_timing=True)
             ev1 = torch.cuda.Event(enable_timing=True)
-            torch.cuda.synchronize()
+            try:
+                torch.cuda.synchronize(device=inputs_embeds.device)
+            except Exception:
+                pass
             ev0.record()
 
         output = super().generate(
@@ -630,9 +637,12 @@ class Videollama2MistralForCausalLM(MistralForCausalLM, Videollama2MetaForCausal
             **kwargs,
         )
 
-        if torch.cuda.is_available():
+        if use_cuda_timing:
             ev1.record()
-            torch.cuda.synchronize()
+            try:
+                torch.cuda.synchronize(device=inputs_embeds.device)
+            except Exception:
+                pass
             decode_gpu_ms = float(ev0.elapsed_time(ev1))
 
         if tokenizer is None:
