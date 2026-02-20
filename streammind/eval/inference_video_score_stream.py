@@ -268,6 +268,13 @@ def maybe_optimize_clip_with_ipex(model, dtype=torch.bfloat16, enable=False):
     return True
 
 
+def _resolve_clip_device(device_arg: str) -> torch.device:
+    d = torch.device(device_arg)
+    if d.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError(f"--clip_device={device_arg} requested but CUDA is not available.")
+    return d
+
+
 def sample_indices(vr, sampling_fps):
     video_fps = float(vr.get_avg_fps())
     stride = max(1, int(round(video_fps / float(sampling_fps))))
@@ -707,10 +714,11 @@ def run_bench_clip_only(args):
 def summarize_clip_paced(rows: List[Dict]):
     by = {}
     for r in rows:
-        by.setdefault((r["num_cores"], r["input_fps"]), []).append(r)
+        clip_device = str(r.get("clip_device", "cpu"))
+        by.setdefault((clip_device, r["num_cores"], r["input_fps"]), []).append(r)
 
     summary = []
-    for (cores, fps), rs in sorted(by.items(), key=lambda x: (x[0][0], x[0][1])):
+    for (clip_device, cores, fps), rs in sorted(by.items(), key=lambda x: (x[0][0], x[0][1], x[0][2])):
         e2e = np.array([r["e2e_ms"] for r in rs], dtype=np.float64)
         queue = np.array([r["queue_ms"] for r in rs], dtype=np.float64)
         proc = np.array([r["proc_ms"] for r in rs], dtype=np.float64)
@@ -731,6 +739,7 @@ def summarize_clip_paced(rows: List[Dict]):
         achieved_fps = float(completed_count / measure_duration_s) if measure_duration_s > 0 else 0.0
         summary.append(
             {
+                "clip_device": clip_device,
                 "num_cores": int(cores),
                 "input_fps": int(fps),
                 "offered_fps": float(fps),
@@ -775,42 +784,52 @@ def plot_clip_paced_metric(
     import matplotlib.pyplot as plt
 
     os.makedirs(outdir, exist_ok=True)
-    core_list = sorted(set(s["num_cores"] for s in summary))
+    device_list = sorted(set(str(s.get("clip_device", "cpu")) for s in summary))
+    core_list = sorted(set(int(s["num_cores"]) for s in summary))
 
     plt.figure(figsize=(9, 5.5))
     x_all = []
-    for core_idx, cores in enumerate(core_list):
-        sub = sorted([s for s in summary if s["num_cores"] == cores], key=lambda x: x["input_fps"])
-        xs = np.array([s.get("offered_fps", s["input_fps"]) for s in sub], dtype=np.float64)
-        ys = np.array([s[y_key] for s in sub], dtype=np.float64)
-        if xs.size == 0:
-            continue
-        order = np.argsort(xs)
-        xs = xs[order]
-        ys = ys[order]
-        x_all.extend(xs.tolist())
-
-        (line,) = plt.plot(xs, ys, marker="o", markersize=4.0, linewidth=2.2, label=f"{cores} cores")
-        color = line.get_color()
-        # Slightly offset labels per core so both lines remain readable at the same x.
-        y_offset_points = 8 if (core_idx % 2 == 0) else -10
-        for x, y in zip(xs, ys):
-            if y_key == "achieved_fps":
-                label = f"{y:.2f}"
-            elif y >= 100:
-                label = f"{y:.1f}"
-            else:
-                label = f"{y:.2f}"
-            plt.annotate(
-                label,
-                (x, y),
-                textcoords="offset points",
-                xytext=(0, y_offset_points),
-                ha="center",
-                fontsize=7,
-                color="black",
-                bbox=dict(boxstyle="round,pad=0.12", fc="white", ec="none", alpha=0.65),
+    line_idx = 0
+    for clip_device in device_list:
+        for cores in core_list:
+            sub = sorted(
+                [s for s in summary if str(s.get("clip_device", "cpu")) == clip_device and s["num_cores"] == cores],
+                key=lambda x: x["input_fps"],
             )
+            xs = np.array([s.get("offered_fps", s["input_fps"]) for s in sub], dtype=np.float64)
+            ys = np.array([s[y_key] for s in sub], dtype=np.float64)
+            if xs.size == 0:
+                continue
+            order = np.argsort(xs)
+            xs = xs[order]
+            ys = ys[order]
+            x_all.extend(xs.tolist())
+
+            label = f"{cores} cores"
+            if len(device_list) > 1:
+                label = f"{cores} cores ({clip_device})"
+            plt.plot(xs, ys, marker="o", markersize=4.0, linewidth=2.2, label=label)
+
+            # Slightly offset labels so overlapping series remain readable.
+            y_offset_points = 8 if (line_idx % 2 == 0) else -10
+            for x, y in zip(xs, ys):
+                if y_key == "achieved_fps":
+                    v = f"{y:.2f}"
+                elif y >= 100:
+                    v = f"{y:.1f}"
+                else:
+                    v = f"{y:.2f}"
+                plt.annotate(
+                    v,
+                    (x, y),
+                    textcoords="offset points",
+                    xytext=(0, y_offset_points),
+                    ha="center",
+                    fontsize=7,
+                    color="black",
+                    bbox=dict(boxstyle="round,pad=0.12", fc="white", ec="none", alpha=0.65),
+                )
+            line_idx += 1
 
     if show_identity and len(x_all) > 0:
         x_min = float(min(x_all))
@@ -849,6 +868,8 @@ def run_bench_clip_paced(args):
     os.environ["STREAMMIND_CPU_DTYPE"] = args.cpu_dtype
 
     dtype = torch.bfloat16 if args.cpu_dtype == "bf16" else torch.float32
+    clip_device = _resolve_clip_device(args.clip_device)
+    use_cuda_clip = clip_device.type == "cuda"
     fps_list = [int(x.strip()) for x in args.fps_list.split(",") if x.strip()]
     core_list = [int(x.strip()) for x in args.core_list.split(",") if x.strip()]
 
@@ -862,21 +883,26 @@ def run_bench_clip_paced(args):
             socket_id=args.socket_id,
             cores_per_socket=args.cores_per_socket,
             interop_threads=args.interop_threads,
+            hide_cuda=not use_cuda_clip,
         )
         print(
             f"[CLIP-PACED] cores={num_cores} socket={args.socket_id} "
             f"core_range={used_cores[0]}-{used_cores[-1]}"
         )
-        print("[CLIP-PACED] loading model on CPU...")
+        print(f"[CLIP-PACED] loading model on CPU (clip_device={clip_device})...")
 
         model, processor, tokenizer, version = model_init_cpu(
             args.model_path, model_base=args.model_base, model_name=args.model_name
         )
         model = model.eval()
-        clip_ipex_enabled = maybe_optimize_clip_with_ipex(model, dtype=dtype, enable=args.use_ipex_clip)
+        clip_ipex_enabled = False
+        if not use_cuda_clip:
+            clip_ipex_enabled = maybe_optimize_clip_with_ipex(model, dtype=dtype, enable=args.use_ipex_clip)
+        elif args.use_ipex_clip:
+            print("[CLIP-PACED] --use_ipex_clip ignored for CUDA clip device.")
         print(f"[CLIP-PACED] model loaded. ipex_clip={clip_ipex_enabled}")
         vt = model.get_model().get_vision_tower()
-        vt = vt.to(device="cpu", dtype=dtype)
+        vt = vt.to(device=clip_device, dtype=dtype)
         vt.eval()
 
         vr = VideoReader(args.video_path, ctx=cpu(0), num_threads=1)
@@ -891,9 +917,11 @@ def run_bench_clip_paced(args):
             for j in range(warmup_total):
                 frame_id = (args.start_frame + j) % num_frames
                 img = Image.fromarray(vr[frame_id].asnumpy())
-                x = processor([img], num_frames=1).to(device="cpu", dtype=dtype)
+                x = processor([img], num_frames=1).to(device=clip_device, dtype=dtype, non_blocking=True)
                 with torch.inference_mode():
                     _ = vt(x)
+                    if use_cuda_clip:
+                        torch.cuda.synchronize(clip_device)
 
             t_stream0 = time.perf_counter()
             for step in range(int(args.steps)):
@@ -909,12 +937,16 @@ def run_bench_clip_paced(args):
 
                 t_p0 = time.perf_counter()
                 img = Image.fromarray(vr[frame_id].asnumpy())
-                x = processor([img], num_frames=1).to(device="cpu", dtype=dtype)
+                x = processor([img], num_frames=1).to(device=clip_device, dtype=dtype, non_blocking=True)
                 prep_ms = (time.perf_counter() - t_p0) * 1000.0
 
                 with torch.inference_mode():
+                    if use_cuda_clip:
+                        torch.cuda.synchronize(clip_device)
                     t_c0 = time.perf_counter()
                     _ = vt(x)
+                    if use_cuda_clip:
+                        torch.cuda.synchronize(clip_device)
                     clip_ms = (time.perf_counter() - t_c0) * 1000.0
 
                 process_end = time.perf_counter()
@@ -941,6 +973,7 @@ def run_bench_clip_paced(args):
                         "e2e_ms": float(e2e_ms),
                         "miss_deadline": int(miss_deadline),
                         "ipex_clip": int(clip_ipex_enabled),
+                        "clip_device": str(clip_device),
                     }
                 )
 
@@ -965,6 +998,7 @@ def run_bench_clip_paced(args):
             "e2e_ms",
             "miss_deadline",
             "ipex_clip",
+            "clip_device",
         ],
     )
     write_csv(
@@ -972,6 +1006,7 @@ def run_bench_clip_paced(args):
         summary,
         [
             "num_cores",
+            "clip_device",
             "input_fps",
             "offered_fps",
             "completed_count",
@@ -1009,7 +1044,8 @@ def run_bench_clip_paced(args):
         filename="clip_paced_queue_p99_vs_offered_fps.png",
         title=(
             f"Paced CLIP Queueing (p99) | cores={args.core_list} "
-            f"socket={args.socket_id} dtype={args.cpu_dtype} ipex={int(args.use_ipex_clip)}"
+            f"socket={args.socket_id} dtype={args.cpu_dtype} "
+            f"ipex={int(args.use_ipex_clip)} clip={args.clip_device}"
         ),
     )
     plot_clip_paced_metric(
@@ -1020,7 +1056,8 @@ def run_bench_clip_paced(args):
         filename="clip_paced_e2e_p99_vs_offered_fps.png",
         title=(
             f"Paced CLIP E2E (p99) | cores={args.core_list} "
-            f"socket={args.socket_id} dtype={args.cpu_dtype} ipex={int(args.use_ipex_clip)}"
+            f"socket={args.socket_id} dtype={args.cpu_dtype} "
+            f"ipex={int(args.use_ipex_clip)} clip={args.clip_device}"
         ),
     )
     plot_clip_paced_metric(
@@ -1031,7 +1068,8 @@ def run_bench_clip_paced(args):
         filename="clip_paced_clip_p50_vs_offered_fps.png",
         title=(
             f"Paced CLIP Service Time (p50) | cores={args.core_list} "
-            f"socket={args.socket_id} dtype={args.cpu_dtype} ipex={int(args.use_ipex_clip)}"
+            f"socket={args.socket_id} dtype={args.cpu_dtype} "
+            f"ipex={int(args.use_ipex_clip)} clip={args.clip_device}"
         ),
     )
     plot_clip_paced_metric(
@@ -1042,7 +1080,8 @@ def run_bench_clip_paced(args):
         filename="clip_paced_achieved_fps_vs_offered_fps.png",
         title=(
             f"Paced CLIP Throughput | cores={args.core_list} "
-            f"socket={args.socket_id} dtype={args.cpu_dtype} ipex={int(args.use_ipex_clip)}"
+            f"socket={args.socket_id} dtype={args.cpu_dtype} "
+            f"ipex={int(args.use_ipex_clip)} clip={args.clip_device}"
         ),
         show_identity=True,
     )
@@ -1885,6 +1924,7 @@ if __name__ == "__main__":
     parser.add_argument("--cores_per_socket", type=int, default=16)
     parser.add_argument("--interop_threads", type=int, default=1)
     parser.add_argument("--cpu_dtype", type=str, default="bf16", choices=["bf16", "fp32"])
+    parser.add_argument("--clip_device", type=str, default="cpu")
     parser.add_argument("--use_ipex_clip", action="store_true")
     parser.add_argument("--decode_on_gpu", action="store_true")
     parser.add_argument("--decode_device", type=str, default="cuda:0")
